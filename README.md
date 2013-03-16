@@ -32,7 +32,7 @@ redundant power supplies come at a cost not all can afford.
 The problem is that, with a single power supply server, the PDU feeding the 
 node becomes a single point of failure. If the PDU fails, both the IPMI and
 PDU fence methods will fail. This would leave the cluster in a blocked state
-as the surviving peer will be unable to determine the state of the lost node.
+as the surviving node will be unable to determine the state of the lost node.
 
 
 -=] The Solution
@@ -44,3 +44,4 @@ a crashed or hung node will continue to provide a link to the peer node. Thus,
 if the link is down, we can somewhat safely assume that the peer has lost 
 power. If the node has lost power, we can safely return a "fence success" exit
 code, allowing recovery to begin.
+
