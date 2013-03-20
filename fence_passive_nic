@@ -443,7 +443,7 @@ The goal of this agent is to allow the administrator to connect a dedicated netw
 		<content type="string" />
 		<shortdesc lang="en">The network interface name to check for a link status.</shortdesc>
 	</parameter>
-	<parameter name="password" unique="1">
+	<parameter name="passwd" unique="1">
 		<getopt mixed="-p" />
 		<content type="string" />
 		<shortdesc lang="en">This is the password needed to authenticate against the ricci user.</shortdesc>
@@ -713,7 +713,7 @@ sub read_stdin
 		chomp $option;
 		
 		# Record the line for now, but comment this out before release.
-		record ($conf, $log, "Processing option line: [$option]\n") if $conf->{'system'}{debug};
+		record($conf, $log, "Processing option line: [$option]\n", 2);
 		
 		# strip leading and trailing whitespace
 		$option =~ s/^\s*//;
@@ -752,7 +752,7 @@ sub read_stdin
 			# This sets the port number to act on.
 			$conf->{'system'}{device} = $value;
 		}
-		elsif ($name eq "password")
+		elsif ($name eq "passwd")
 		{
 			# This sets the password to use for ricci.
 			$conf->{'system'}{password} = $value;
