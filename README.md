@@ -45,3 +45,77 @@ if the link is down, we can somewhat safely assume that the peer has lost
 power. If the node has lost power, we can safely return a "fence success" exit
 code, allowing recovery to begin.
 
+
+-=] Requirements
+
+This agent will fail if any of these requirements are not met.
+
+* There _must_ be at least one other fence agent configured with a higher
+  priority.
+* It must be a two-node cluster.
+* When using multiple NICs for verifying the peer's state, all NICs must show
+  their link as being down.
+* This agent only supports cman-based clusters.
+* It is not a strict requirement, but it is *EXTREMELY* strongly recommended
+  that you use _at_ _least_ two separate NICs to help prevent false-positives.
+
+
+-=] Example
+
+In this example, two network interfaces (eth1 and eth2)  are used for sensing.
+Neither needs an IP address, but they do need to be started when the node 
+boots. (That is, the 'ifcfg-ethX' files need 'BOOTPROTO="none"' and 
+'ONBOOT="yes"').
+
+NOTE: The 'passwd' is for the 'ricci' user. This is needed when the agent 
+      checks to ensure that another fence agent has been configured.
+
+In the example below, both IPMI and switched PDU fencing has been configured
+for use before 'fence_passive_nic'. The goal here is to ensure that this 
+agent only gets called when both preferrable fencing methods have failed.
+
+
+Sample cluster.conf:
+
+<?xml version="1.0"?>
+<cluster config_version="4" name="an-cluster-04">
+	<cman expected_votes="1" two_node="1"/>
+	<clusternodes>
+		<clusternode name="an-c04n01.alteeve.ca" nodeid="1">
+			<fence>
+				<method name="ipmi">
+					<device action="reboot" delay="15" name="ipmi_n01"/>
+				</method>
+				<method name="pdu">
+					<device action="reboot" name="pdu1" port="1"/>
+				</method>
+				<method name="nic">
+					<device action="reboot" name="nic" port="eth1,eth2"/>
+				</method>
+			</fence>
+		</clusternode>
+		<clusternode name="an-c04n02.alteeve.ca" nodeid="2">
+			<fence>
+				<method name="ipmi">
+					<device action="reboot" name="ipmi_n02"/>
+				</method>
+				<method name="pdu">
+					<device action="reboot" name="pdu2" port="1"/>
+				</method>
+				<method name="nic">
+					<device action="reboot" name="nic" port="eth1,eth2"/>
+				</method>
+			</fence>
+		</clusternode>
+	</clusternodes>
+	<fencedevices>
+		<fencedevice agent="fence_ipmilan" ipaddr="an-c04n01.ipmi" login="admin" name="ipmi_n01" passwd="secret"/>
+		<fencedevice agent="fence_ipmilan" ipaddr="an-c04n02.ipmi" login="admin" name="ipmi_n02" passwd="secret"/>
+		<fencedevice agent="fence_apc_snmp" ipaddr="an-p03.alteeve.ca" name="pdu1"/>
+		<fencedevice agent="fence_apc_snmp" ipaddr="an-p04.alteeve.ca" name="pdu2"/>
+		<fencedevice agent="fence_passive_nic" name="nic" passwd="secret"/>
+	</fencedevices>
+	<fence_daemon post_join_delay="30"/>
+	<totem rrp_mode="none" secauth="off"/>
+</cluster>
+
