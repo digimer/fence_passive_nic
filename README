@@ -1,7 +1,7 @@
 fence_passive_nic
 =================
 
-Passive fence agent for Red Hat and Pacemaker clusters. 
+Passive fence agent for Red Hat clusters. 
 
 ##############################################################################
 #                       THIS IS A PASSIVE FENCE AGENT!                       #
