@@ -48,11 +48,16 @@ my $conf={
 		list		=>	"",
 		'log'		=>	"/var/log/fence_passive_nic.log",
 		monitor		=>	"",
+		node_name	=>	"",	# My name, as reported by cman_tool
+		nodes		=>	0,	# Number of nodes in the cluster
+		password	=>	"",
 		quiet		=>	0,
 		version		=>	0,
 	},
 	path		=>	{
 		ethtool		=>	"/sbin/ethtool",
+		ccs		=>	"/usr/sbin/ccs",
+		cman_tool	=>	"/usr/sbin/cman_tool",
 	},
 };
 
@@ -94,13 +99,26 @@ if ($conf->{'system'}{version})
 }
 
 # Start the logs.
-record($conf, $log, "-=] Called at: [".get_date_time($conf)."]\n");
+record($conf, $log, "-=] Called at: [".get_date_time($conf)."]\n", 2);
 
 # Make sure I was passed a network card name.
 if (not $conf->{'system'}{device})
 {
-	record($conf, $log, "Called without a network device name! Please set: [node=\"<dev>\"] in cluster.conf or use: [-n <dev>] at the command line!\n", 1);
+	$bad = 1;
+	record($conf, $log, "Called without a network device name! Please set: [node=\"<dev>{,<dev2>}\"] in cluster.conf or use: [-n <dev>{,<dev2>}] at the command line!\n", 1);
 }
+
+# Make sure there is at least one other fence agent configured before this one.
+($bad) = check_for_other_agents($conf);
+
+# Make sure this cluster has only two nodes.
+if ($conf->{'system'}{nodes} != 2)
+{
+	$bad = 1;
+	record($conf, $log, "The 'fence_passive_nic' fence agent can only be used in two-node clusters!\n", 1);
+}
+
+# If anything went wrong, die now.
 if ($bad)
 {
 	record($conf, $log, "Exiting on errors.\n", 1);
@@ -136,6 +154,182 @@ do_exit($conf, $log, $exit_code);
 # Here be functions.                                                          #
 ###############################################################################
 
+# Map fence device names to fence agents.
+sub map_fence_devices_to_agents
+{
+	my ($conf) = @_;
+	
+	my $fh = IO::Handle->new();
+	my $sc = "$conf->{path}{ccs} -h localhost -p $conf->{'system'}{password} --lsfencedev";
+	record($conf, $log, "calling: [$sc]\n") if $conf->{'system'}{debug};
+	open ($fh, "$sc 2>&1 |") || die "Shell call: [$sc] failed; Error: $!\n";
+	while (<$fh>)
+	{
+		chomp;
+		my $line = $_;
+		record($conf, $log, "Output: [$line]\n") if $conf->{'system'}{debug};
+		if ($line =~ /^(.*?):.*?agent=(\S+)/)
+		{
+			my $device = $1;
+			my $agent  = $2;
+			$conf->{fence_device}{$device} = $agent;
+			record($conf, $log, "Found device: [$device] which uses agent: [$conf->{fence_device}{$device}]\n") if $conf->{'system'}{debug};
+		}
+	}
+	$fh->close;
+	my $exit = $?;
+	record($conf, $log, "Exit code: [$exit]\n") if $conf->{'system'}{debug};
+	
+	return(0);
+}
+
+# Get the name of this node.
+sub get_local_node_name
+{
+	my ($conf) = @_;
+	
+	my $fh = IO::Handle->new();
+	my $sc = "$conf->{path}{cman_tool} status";
+	record($conf, $log, "calling: [$sc]\n") if $conf->{'system'}{debug};
+	open ($fh, "$sc 2>&1 |") || die "Shell call: [$sc] failed; Error: $!\n";
+	while (<$fh>)
+	{
+		chomp;
+		my $line = $_;
+		record($conf, $log, "Output: [$line]\n") if $conf->{'system'}{debug};
+		if ($line =~ /Cannot open connection/i)
+		{
+			# The user must run this while the cluster is up.
+			record($conf, $log, "The cluster is not running. Please start 'cman' and try again.\n", 1);
+			do_exit($conf, $log, 9);
+		}
+		if ($line =~ /Node name: (.*)/)
+		{
+			$conf->{'system'}{node_name} = $1;
+			record($conf, $log, "Found my name: [$conf->{'system'}{node_name}]\n") if $conf->{'system'}{debug};
+		}
+	}
+	$fh->close;
+	my $exit = $?;
+	record($conf, $log, "Exit code: [$exit]\n") if $conf->{'system'}{debug};
+	
+	return(0);
+}
+
+# Get the peer's name
+sub get_peer_node_name
+{
+	my ($conf) = @_;
+	
+	# This is used to make sure this is a two-node cluster.
+	$conf->{'system'}{nodes} = 0;
+	my $fh = IO::Handle->new();
+	my $sc = "$conf->{path}{cman_tool} nodes";
+	record($conf, $log, "calling: [$sc]\n") if $conf->{'system'}{debug};
+	open ($fh, "$sc 2>&1 |") || die "Shell call: [$sc] failed; Error: $!\n";
+	while (<$fh>)
+	{
+		chomp;
+		my $line = $_;
+		record($conf, $log, "Output: [$line]\n") if $conf->{'system'}{debug};
+		next if $line =~ /^Node/; # Skip the title line.
+		my ($node) = ($line =~ /.*?\s(\S+)$/);
+		if ($node ne $conf->{'system'}{node_name})
+		{
+			$conf->{'system'}{peer_name} = $node;
+			record($conf, $log, "Peer node: [$conf->{'system'}{peer_name}]\n") if $conf->{'system'}{debug};
+		}
+		$conf->{'system'}{nodes}++;
+	}
+	$fh->close;
+	my $exit = $?;
+	record($conf, $log, "Exit code: [$exit]\n") if $conf->{'system'}{debug};
+	
+	return(0);
+}
+
+# This uses 'ccs' to verify that there is at least one other agent configured
+# before fence_passive_nic.
+sub check_for_other_agents
+{
+	my ($conf) = @_;
+	
+	record($conf, $log, "Checking that at least one other fence method is used before me.\n") if $conf->{'system'}{debug};
+	map_fence_devices_to_agents($conf);
+	record($conf, $log, "Getting my name.\n") if $conf->{'system'}{debug};
+	get_local_node_name($conf);
+	record($conf, $log, "I am: [$conf->{'system'}{node_name}]. Getting my peer's name.\n") if $conf->{'system'}{debug};
+	get_peer_node_name($conf);
+	record($conf, $log, "My peer is: [$conf->{'system'}{peer_name}].\n") if $conf->{'system'}{debug};
+	
+	my $bad = 1;
+	my $victim = $conf->{'system'}{peer_name};
+	record($conf, $log, "Victime node: [$victim]\n") if $conf->{'system'}{debug};
+	my $parse  = 0;
+	my $fh = IO::Handle->new();
+	my $sc = "$conf->{path}{ccs} -h localhost -p $conf->{'system'}{password} --lsfenceinst";
+	record($conf, $log, "calling: [$sc]\n") if $conf->{'system'}{debug};
+	open ($fh, "$sc 2>&1 |") || die "Shell call: [$sc] failed; Error: $!\n";
+	while (<$fh>)
+	{
+		chomp;
+		my $line = $_;
+		record($conf, $log, "Output: [$line], victim: [$victim]\n") if $conf->{'system'}{debug};
+		if ($line =~ /$victim/)
+		{
+			$parse = 1;
+			record($conf, $log, "Found the victim's fence devices.\n") if $conf->{'system'}{debug};
+			next;
+		}
+		
+		if ($parse)
+		{
+			# A line that doesn't start with a space is a new node.
+			if ($line =~ /^\S/)
+			{
+				$parse = 0;
+				record($conf, $log, "Left the victim's fence devices.\n") if $conf->{'system'}{debug};
+				next;
+			}
+			if ($line =~ /(\S+):/)
+			{
+				my $device = $1;
+				my $agent  = $conf->{fence_device}{$device};
+				record($conf, $log, "Parsed device: [$device] which uses agent: [$agent].\n") if $conf->{'system'}{debug};
+				if ($agent)
+				{
+					# I found at least one other pre-defined agent.
+					if ($agent ne "fence_passive_nic")
+					{
+						record($conf, $log, "The agent is different, we're good to go.\n") if $conf->{'system'}{debug};
+						$bad = 0;
+						last;
+					}
+					else
+					{
+						record($conf, $log, "The agent is ours! This will not do.\n") if $conf->{'system'}{debug};
+						last;
+					}
+				}
+				else
+				{
+					record($conf, $log, "No agent defined for this device!\n") if $conf->{'system'}{debug};
+				}
+			}
+		}
+	}
+	$fh->close;
+	my $exit = $?;
+	record($conf, $log, "Exit code: [$exit]\n") if $conf->{'system'}{debug};
+
+	if ($bad)
+	{
+		record($conf, $log, "Failed to find another fence device before this one!\n", 1);
+	}
+	
+	return ($bad);
+}
+
 # This cleanly exits the agent.
 sub do_exit
 {
@@ -153,28 +347,65 @@ sub do_exit
 # 'off'.
 sub get_state
 {
-	my ($conf, $log, $nodes) = @_;
+	my ($conf, $log) = @_;
 	
 	$conf->{'system'}{link_state} = "";
-	my $fh = IO::Handle->new();
-	my $sc = "$conf->{path}{ethtool} $conf->{'system'}{device}";
-	record($conf, $log, "calling: [$sc]\n") if $conf->{'system'}{debug};
-	open ($fh, "$sc 2>&1 |") || die "Shell call: [$sc] failed; Error: $!\n";
-	while (<$fh>)
+	my $yes_count = 0;
+	my $no_count  = 0;
+	my $seen      = 0;
+	
+	# There may be one or more devices specified.
+	foreach my $device (split/,/, $conf->{'system'}{device})
 	{
-		chomp;
-		my $line = $_;
-		record($conf, $log, "Output: [$line]\n") if $conf->{'system'}{debug};
-		if (lc($line) =~ /link detected: (.*)/)
+		$seen++;
+		my $this_state = "";
+		my $fh = IO::Handle->new();
+		my $sc = "$conf->{path}{ethtool} $device";
+		record($conf, $log, "calling: [$sc]\n") if $conf->{'system'}{debug};
+		open ($fh, "$sc 2>&1 |") || die "Shell call: [$sc] failed; Error: $!\n";
+		while (<$fh>)
 		{
-			$conf->{'system'}{link_state} = $1;
-			record($conf, $log, "Read link state as: [$conf->{'system'}{link_state}]\n") if $conf->{'system'}{debug};
-			last;
+			chomp;
+			my $line = $_;
+			record($conf, $log, "Output: [$line]\n") if $conf->{'system'}{debug};
+			if (lc($line) =~ /link detected: (.*)/)
+			{
+				$this_state = $1;
+				record($conf, $log, "Read link state of: [$device] as: [$this_state]\n") if $conf->{'system'}{debug};
+				last;
+			}
+		}
+		$fh->close;
+		my $exit = $?;
+		record($conf, $log, "Exit code: [$exit]\n") if $conf->{'system'}{debug};
+		
+		if ($this_state eq "yes")
+		{
+			record($conf, $log, "The: [$device] shows a link.\n");
+			$yes_count++;
+		}
+		elsif ($this_state eq "no")
+		{
+			record($conf, $log, "The: [$device] does not show a link.\n");
+			$no_count++;
+		}
+		else
+		{
+			record($conf, $log, "WARNING: Unable to read the link state for: [$device].\n");
 		}
 	}
-	$fh->close;
-	my $exit = $?;
-	record($conf, $log, "Exit code: [$exit]\n") if $conf->{'system'}{debug};
+	
+	# If I see even one "yes", set the state to "yes" as the other node
+	# has power. If all the states I read where 'no', then set the state
+	# to "no".
+	if ($yes_count > 0)
+	{
+		$conf->{'system'}{link_state} = "yes";
+	}
+	elsif ($no_count == $seen)
+	{
+		$conf->{'system'}{link_state} = "no";
+	}
 	
 	# Return the hash reference.
 	return ($conf->{'system'}{link_state});
@@ -211,6 +442,11 @@ The goal of this agent is to allow the administrator to connect a dedicated netw
 		<getopt mixed="-n" />
 		<content type="string" />
 		<shortdesc lang="en">The network interface name to check for a link status.</shortdesc>
+	</parameter>
+	<parameter name="password" unique="1">
+		<getopt mixed="-p" />
+		<content type="string" />
+		<shortdesc lang="en">This is the password needed to authenticate against the ricci user.</shortdesc>
 	</parameter>
 	<parameter name="action" unique="1">
 		<getopt mixed="-o" />
@@ -279,12 +515,26 @@ sub process_action
 		# Unfencing the node.
 		if (get_state($conf, $log, $conf->{'system'}{device}) eq "yes")
 		{
-			record($conf, $log, "SUCCESS: Device: [$conf->{'system'}{device}] shows a link.\n");
+			if ($conf->{'system'}{device} =~ /,/)
+			{
+				record($conf, $log, "SUCCESS: At least one of the: [$conf->{'system'}{device}] devices shows a link.\n");
+			}
+			else
+			{
+				record($conf, $log, "SUCCESS: Device: [$conf->{'system'}{device}] shows a link.\n");
+			}
 			do_exit($conf, $log, 0);
 		}
 		else
 		{
-			record($conf, $log, "FAILED: Device: [$conf->{'system'}{device}] shows no link.\n");
+			if ($conf->{'system'}{device} =~ /,/)
+			{
+				record($conf, $log, "FAILED: The: [$conf->{'system'}{device}] devices show no link.\n");
+			}
+			else
+			{
+				record($conf, $log, "FAILED: Device: [$conf->{'system'}{device}] shows no link.\n");
+			}
 			do_exit($conf, $log, 1);
 		}
 	}
@@ -294,12 +544,26 @@ sub process_action
 		# needs for success is 'off'.
 		if (get_state($conf, $log, $conf->{'system'}{device}) eq "no")
 		{
-			record($conf, $log, "SUCCESS: Device: [$conf->{'system'}{device}] shows no link.\n");
+			if ($conf->{'system'}{device} =~ /,/)
+			{
+				record($conf, $log, "SUCCESS: The: [$conf->{'system'}{device}] devices show no link.\n");
+			}
+			else
+			{
+				record($conf, $log, "SUCCESS: Device: [$conf->{'system'}{device}] shows no link.\n");
+			}
 			do_exit($conf, $log, 0);
 		}
 		else
 		{
-			record($conf, $log, "FAILED: Device: [$conf->{'system'}{device}] shows a link.\n");
+			if ($conf->{'system'}{device} =~ /,/)
+			{
+				record($conf, $log, "FAILED: At least one of the: [$conf->{'system'}{device}] devices shows a link.\n");
+			}
+			else
+			{
+				record($conf, $log, "FAILED: Device: [$conf->{'system'}{device}] shows a link.\n");
+			}
 			do_exit($conf, $log, 1);
 		}
 	}
@@ -312,17 +576,38 @@ sub process_action
 		my $state = get_state($conf, $log, $conf->{'system'}{device});
 		if ($state eq "yes")
 		{
-			record($conf, $log, "Status: Link is up\n");
+			if ($conf->{'system'}{device} =~ /,/)
+			{
+				record($conf, $log, "Status: At least one link is up\n");
+			}
+			else
+			{
+				record($conf, $log, "Status: Link is up\n");
+			}
 			do_exit($conf, $log, 0);
 		}
 		elsif ($state eq "no")
 		{
-			record($conf, $log, "Status: Link is down\n");
+			if ($conf->{'system'}{device} =~ /,/)
+			{
+				record($conf, $log, "Status: Links are down\n");
+			}
+			else
+			{
+				record($conf, $log, "Status: Link is down\n");
+			}
 			do_exit($conf, $log, 2);
 		}
 		else
 		{
-			record($conf, $log, "Status: Link state unknown\n");
+			if ($conf->{'system'}{device} =~ /,/)
+			{
+				record($conf, $log, "Status: At least one link state is unknown\n");
+			}
+			else
+			{
+				record($conf, $log, "Status: Link state unknown\n");
+			}
 			do_exit($conf, $log, 1);
 		}
 	}
@@ -359,41 +644,48 @@ sub read_cla
 			$set_next="";
 			next;
 		}
-		if ($arg=~/-h/)
+		
+		if ($arg =~ /-h/)
 		{
 			# Print the help message and then exit.
 			help($conf, $log);
 		}
-		elsif ($arg=~/--version/)
+		elsif ($arg =~ /--version/)
 		{
 			# Print the version information and then exit.
 			$conf->{'system'}{version} = 1;
 			record($conf, $log, "Setting version\n") if $conf->{'system'}{debug};
 		}
-		elsif ($arg=~/-q/)
+		elsif ($arg =~ /-q/)
 		{
 			# Suppress all messages, including critical messages, from STDOUT.
 			$conf->{'system'}{quiet} = 1;
 		}
-		elsif ($arg=~/-d/)
+		elsif ($arg =~ /-d/)
 		{
 			# Enable debug mode.
 			$conf->{'system'}{debug} = 1;
 		}
-		elsif ($arg=~/^-/)
+		elsif ($arg =~ /^-/)
 		{
-			$arg=~s/^-//;
+			$arg =~ s/^-//;
 			if ($arg eq "n")
 			{
 				# This is the node to work on.
 				$set_next = "device";
-				record ($conf, $log, "Next argument will be stored in: [$set_next]\n") if $conf->{'system'}{debug};
+				#record ($conf, $log, "Next argument will be stored in: [$set_next]\n") if $conf->{'system'}{debug};
 			}
 			elsif ($arg eq "o")
 			{
 				# This is the action to take.
 				$set_next = "action";
-				record ($conf, $log, "Next argument will be stored in: [$set_next]\n") if $conf->{'system'}{debug};
+				#record ($conf, $log, "Next argument will be stored in: [$set_next]\n") if $conf->{'system'}{debug};
+			}
+			elsif ($arg eq "p")
+			{
+				# This sets the password to use for ricci.
+				$set_next = "password";
+				#record ($conf, $log, "Next argument will be stored in: [$set_next]\n") if $conf->{'system'}{debug};
 			}
 		}
 		else
@@ -437,10 +729,11 @@ sub read_stdin
 		next if not $option;
 		
 		# Split the option up into the name and the value.
-		my ($name,$value) = split /\s*=\s*/, $option;
+		my ($name, $value) = split /\s*=\s*/, $option;
 		
 		# Record the line for now, but comment this out before release.
-		record ($conf, $log, "Name: [$name], value: [$value].\n") if $conf->{'system'}{debug};
+		#record ($conf, $log, "Name: [$name], value: [$value].\n") if $conf->{'system'}{debug};
+		record ($conf, $log, "Name: [$name], value: [$value].\n");
 		
 		# Set my variables depending on the veriable name.
 		if ($name eq "agent")
@@ -458,6 +751,11 @@ sub read_stdin
 		{
 			# This sets the port number to act on.
 			$conf->{'system'}{device} = $value;
+		}
+		elsif ($name eq "password")
+		{
+			# This sets the password to use for ricci.
+			$conf->{'system'}{password} = $value;
 		}
 		elsif ($name eq "nodename")
 		{
@@ -484,8 +782,11 @@ sub record
 	$critical = 0 if not $critical;
 	
 	# The log file gets everything.
-	print $log $msg;
-	print $msg if not $conf->{'system'}{quiet};
+	if ($critical == 2)
+	{
+		print $log $msg;
+	}
+	print $msg if ((not $conf->{'system'}{quiet}) && ($critical != 2));
 	
 	# Critical messages always print.
 	print $msg if (($critical) && ($conf->{'system'}{quiet}));
